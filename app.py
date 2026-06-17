@@ -167,6 +167,17 @@ def colour_vr(val):
     return ""
 
 
+def colour_score(val):
+    try:
+        v = int(val)
+        if v >= 7: return "background-color: #b71c1c; color: #fff; font-weight:bold"
+        if v >= 5: return "background-color: #e65100; color: #fff; font-weight:bold"
+        if v >= 3: return "background-color: #f9a825; color: #000; font-weight:bold"
+    except Exception:
+        pass
+    return ""
+
+
 def _fmt_rsi(x):
     try:
         v = float(x)
@@ -292,9 +303,9 @@ with tab2:
         st.dataframe(
             df_opp[["Name", "Price", "%Chg", "RSI", "Vol Ratio", "Score", "Signal"]]
             .style
-            .map(colour_pct, subset=["%Chg"])
-            .map(colour_rsi, subset=["RSI"])
-            .background_gradient(subset=["Score"], cmap="YlOrRd")
+            .map(colour_pct,   subset=["%Chg"])
+            .map(colour_rsi,   subset=["RSI"])
+            .map(colour_score, subset=["Score"])
             .format({
                 "Price": "{:.2f}", "%Chg": "{:+.2f}%",
                 "RSI": _fmt_rsi, "Vol Ratio": "{:.2f}x",
