@@ -225,13 +225,95 @@ if snap.empty:
     st.error("Could not fetch data. Check internet connection.")
     st.stop()
 
+# ─── Pre-compute opportunity scores (used in top summary + tab2) ──────────────
+
+def build_scores(df):
+    out = df.copy()
+    out["Signal"] = "Neutral"
+    out["Score"]  = 0
+    for i, row in out.iterrows():
+        score, signals = 0, []
+        rsi = row["RSI"]
+        vr  = row["Vol Ratio"]
+        pct = row["%Chg"]
+        rsi_ok = isinstance(rsi, (int, float)) and not np.isnan(float(rsi))
+        if rsi_ok:
+            if rsi <= 35:   score += 3; signals.append("RSI oversold")
+            elif rsi >= 65: score += 2; signals.append("RSI overbought")
+        if vr >= 2.0:       score += 3; signals.append(f"Vol {vr:.1f}x")
+        elif vr >= 1.5:     score += 1; signals.append(f"Vol {vr:.1f}x")
+        if pct >= 2.0:      score += 2; signals.append("Strong up")
+        elif pct <= -2.0:   score += 2; signals.append("Strong down")
+        out.at[i, "Score"]  = score
+        out.at[i, "Signal"] = " | ".join(signals) if signals else "Neutral"
+    return out
+
+df_scored = build_scores(snap)
+df_opp    = df_scored[df_scored["Score"] > 0].sort_values("Score", ascending=False)
+vol_df    = snap[snap["Vol Ratio"] >= 1.3].sort_values("Vol Ratio", ascending=False)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TOP SUMMARY — always visible above tabs
+# ═══════════════════════════════════════════════════════════════════════════════
+
+top_left, top_right = st.columns(2)
+
+with top_left:
+    st.subheader("Top Movers — Today")
+    styled_top = (
+        snap[["Name", "Price", "%Chg", "Vol Ratio", "RSI"]]
+        .sort_values("%Chg", ascending=False)
+        .style
+        .map(colour_pct, subset=["%Chg"])
+        .map(colour_rsi, subset=["RSI"])
+        .map(colour_vr,  subset=["Vol Ratio"])
+        .format({
+            "Price": "{:.2f}", "%Chg": "{:+.2f}%",
+            "Vol Ratio": "{:.2f}x", "RSI": _fmt_rsi,
+        }, na_rep="—")
+    )
+    st.dataframe(styled_top, use_container_width=True, hide_index=True)
+
+with top_right:
+    st.subheader("🚀 Top Signals (Score-ranked)")
+    if df_opp.empty:
+        st.info("No strong signals right now.")
+    else:
+        styled_sig = (
+            df_opp[["Name", "Score", "Signal"]]
+            .style
+            .map(colour_score, subset=["Score"])
+        )
+        st.dataframe(styled_sig, use_container_width=True, hide_index=True)
+    st.caption("Scoring: RSI oversold +3 · Vol surge 2× +3 · Strong move ≥2% +2")
+
+# Volume surge bar
+if not vol_df.empty:
+    st.subheader("🔥 Volume Surge (vs 20-day avg)")
+    fig_vol_top = px.bar(
+        vol_df, x="Name", y="Vol Ratio",
+        color="Vol Ratio", color_continuous_scale="Oranges",
+        text="Vol Ratio", template="plotly_dark",
+    )
+    fig_vol_top.update_traces(texttemplate="%{text:.1f}x", textposition="outside")
+    fig_vol_top.add_hline(y=2.0, line_dash="dash", line_color="red", annotation_text="2× surge")
+    fig_vol_top.update_layout(height=260, margin=dict(t=20, b=10), showlegend=False)
+    st.plotly_chart(fig_vol_top, use_container_width=True)
+    st.caption("Red dashed line = 2× surge threshold")
+
+st.divider()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TABS — detailed analysis
+# ═══════════════════════════════════════════════════════════════════════════════
+
 tab1, tab2, tab3, tab4 = st.tabs([
     "📊 Market Overview", "🚀 Opportunity Scanner", "🔥 Volume Alert", "📉 Chart Viewer"
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
 with tab1:
-    st.subheader("Top 10 SET Stocks — Today")
+    st.subheader("Top 10 SET Stocks — Full Detail")
 
     styled = (
         snap[["Name", "Price", "Chg", "%Chg", "Open", "High", "Low", "Volume", "Vol Ratio", "RSI"]]
@@ -246,7 +328,7 @@ with tab1:
             "Volume": "{:,.0f}", "Vol Ratio": "{:.2f}x", "RSI": _fmt_rsi,
         }, na_rep="—")
     )
-    st.dataframe(styled, use_container_width=True, height=420)
+    st.dataframe(styled, use_container_width=True, height=420, hide_index=True)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -267,36 +349,6 @@ with tab2:
     st.subheader("🚀 Day Trade Opportunity Scanner")
     st.caption("Scores each stock by RSI + Volume surge + Momentum")
 
-    df_opp = snap.copy()
-    df_opp["Signal"] = "Neutral"
-    df_opp["Score"]  = 0
-
-    for i, row in df_opp.iterrows():
-        score, signals = 0, []
-        rsi = row["RSI"]
-        vr  = row["Vol Ratio"]
-        pct = row["%Chg"]
-
-        rsi_ok = isinstance(rsi, (int, float)) and not np.isnan(float(rsi))
-        if rsi_ok:
-            if rsi <= 35:
-                score += 3; signals.append("RSI oversold")
-            elif rsi >= 65:
-                score += 2; signals.append("RSI overbought")
-        if vr >= 2.0:
-            score += 3; signals.append(f"Vol {vr:.1f}x")
-        elif vr >= 1.5:
-            score += 1; signals.append(f"Vol {vr:.1f}x")
-        if pct >= 2.0:
-            score += 2; signals.append("Strong up")
-        elif pct <= -2.0:
-            score += 2; signals.append("Strong down")
-
-        df_opp.at[i, "Score"]  = score
-        df_opp.at[i, "Signal"] = " | ".join(signals) if signals else "Neutral"
-
-    df_opp = df_opp[df_opp["Score"] > 0].sort_values("Score", ascending=False)
-
     if df_opp.empty:
         st.info("No strong signals right now. Market may be calm.")
     else:
@@ -310,7 +362,7 @@ with tab2:
                 "Price": "{:.2f}", "%Chg": "{:+.2f}%",
                 "RSI": _fmt_rsi, "Vol Ratio": "{:.2f}x",
             }, na_rep="—"),
-            use_container_width=True,
+            use_container_width=True, hide_index=True,
         )
 
     st.subheader("RSI vs % Change Map")
@@ -331,8 +383,6 @@ with tab2:
 with tab3:
     st.subheader("🔥 Volume Surge Alert")
     st.caption("Stocks trading above their 20-day average volume")
-
-    vol_df = snap[snap["Vol Ratio"] >= 1.3].sort_values("Vol Ratio", ascending=False)
 
     if vol_df.empty:
         st.info("No unusual volume detected today.")
@@ -356,7 +406,7 @@ with tab3:
                 "Price": "{:.2f}", "%Chg": "{:+.2f}%",
                 "Volume": "{:,.0f}", "Vol Ratio": "{:.2f}x", "RSI": _fmt_rsi,
             }, na_rep="—"),
-            use_container_width=True,
+            use_container_width=True, hide_index=True,
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
