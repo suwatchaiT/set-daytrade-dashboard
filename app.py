@@ -188,19 +188,7 @@ def _fmt_rsi(x):
 
 # ─── Layout ───────────────────────────────────────────────────────────────────
 
-st.title("📈 SET Day-Trade Dashboard")
-st.caption(f"Thailand Stock Exchange  •  Data via Yahoo Finance  •  {datetime.now().strftime('%H:%M:%S ICT')}")
-
-col_ctrl1, col_ctrl2, _ = st.columns([1, 1, 2])
-with col_ctrl1:
-    auto_refresh = st.checkbox("Auto-refresh (5 min)", value=False)
-with col_ctrl2:
-    if st.button("🔄 Refresh Now"):
-        st.cache_data.clear()
-        st.rerun()
-
-# ─── SET Index ────────────────────────────────────────────────────────────────
-
+# SET Index — very first thing on the page
 set_df = fetch_set_index()
 if set_df is not None and len(set_df) >= 2:
     latest  = set_df.iloc[-1]
@@ -209,10 +197,24 @@ if set_df is not None and len(set_df) >= 2:
     idx_pct = idx_chg / safe_float(prev_r["Close"]) * 100
     arrow   = "▲" if idx_chg >= 0 else "▼"
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("SET Index",   f"{safe_float(latest['Close']):,.2f}", f"{arrow} {idx_chg:+.2f} ({idx_pct:+.2f}%)")
-    m2.metric("Today High",  f"{safe_float(latest['High']):,.2f}")
-    m3.metric("Today Low",   f"{safe_float(latest['Low']):,.2f}")
-    m4.metric("Volume (M)",  f"{safe_float(latest['Volume'])/1e6:,.1f}")
+    m1.metric("SET Index",  f"{safe_float(latest['Close']):,.2f}", f"{arrow} {idx_chg:+.2f} ({idx_pct:+.2f}%)")
+    m2.metric("Today High", f"{safe_float(latest['High']):,.2f}")
+    m3.metric("Today Low",  f"{safe_float(latest['Low']):,.2f}")
+    m4.metric("Volume (M)", f"{safe_float(latest['Volume'])/1e6:,.1f}")
+
+st.divider()
+
+# Title + controls below the metrics
+hdr, ctrl1, ctrl2 = st.columns([3, 1, 1])
+with hdr:
+    st.markdown("### 📈 SET Day-Trade Dashboard")
+    st.caption(f"Thailand Stock Exchange  •  Yahoo Finance  •  {datetime.now().strftime('%H:%M:%S ICT')}")
+with ctrl1:
+    auto_refresh = st.checkbox("Auto-refresh (5 min)", value=False)
+with ctrl2:
+    if st.button("🔄 Refresh Now"):
+        st.cache_data.clear()
+        st.rerun()
 
 st.divider()
 
