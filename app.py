@@ -219,9 +219,9 @@ with tab1:
         snap[["Name", "Price", "Chg", "%Chg", "Open", "High", "Low", "Volume", "Vol Ratio", "RSI"]]
         .sort_values("%Chg", ascending=False)
         .style
-        .applymap(colour_pct,  subset=["%Chg", "Chg"])
-        .applymap(colour_rsi,  subset=["RSI"])
-        .applymap(colour_vr,   subset=["Vol Ratio"])
+        .map(colour_pct,  subset=["%Chg", "Chg"])
+        .map(colour_rsi,  subset=["RSI"])
+        .map(colour_vr,   subset=["Vol Ratio"])
         .format({
             "Price": "{:.2f}", "Chg": "{:+.2f}", "%Chg": "{:+.2f}%",
             "Open": "{:.2f}", "High": "{:.2f}", "Low": "{:.2f}",
@@ -297,8 +297,8 @@ with tab2:
         st.dataframe(
             df_opp[["Name", "Price", "%Chg", "RSI", "Vol Ratio", "Score", "Signal"]]
             .style
-            .applymap(colour_pct, subset=["%Chg"])
-            .applymap(colour_rsi, subset=["RSI"])
+            .map(colour_pct, subset=["%Chg"])
+            .map(colour_rsi, subset=["RSI"])
             .background_gradient(subset=["Score"], cmap="YlOrRd")
             .format({"Price": "{:.2f}", "%Chg": "{:+.2f}%", "RSI": _fmt_rsi, "Vol Ratio": "{:.2f}x"}, na_rep="—"),
             use_container_width=True
@@ -342,8 +342,8 @@ with tab3:
         st.dataframe(
             vol_df[["Name", "Price", "%Chg", "Volume", "Vol Ratio", "RSI"]]
             .style
-            .applymap(colour_pct, subset=["%Chg"])
-            .applymap(colour_vr,  subset=["Vol Ratio"])
+            .map(colour_pct, subset=["%Chg"])
+            .map(colour_vr,  subset=["Vol Ratio"])
             .format({"Price": "{:.2f}", "%Chg": "{:+.2f}%", "Volume": "{:,.0f}", "Vol Ratio": "{:.2f}x", "RSI": _fmt_rsi}, na_rep="—"),
             use_container_width=True
         )
