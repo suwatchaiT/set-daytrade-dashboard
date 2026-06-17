@@ -261,20 +261,19 @@ vol_df    = snap[snap["Vol Ratio"] >= 1.3].sort_values("Vol Ratio", ascending=Fa
 top_left, top_right = st.columns(2)
 
 with top_left:
-    st.subheader("Top Movers — Today")
-    styled_top = (
-        snap[["Name", "Price", "%Chg", "Vol Ratio", "RSI"]]
-        .sort_values("%Chg", ascending=False)
-        .style
-        .map(colour_pct, subset=["%Chg"])
-        .map(colour_rsi, subset=["RSI"])
-        .map(colour_vr,  subset=["Vol Ratio"])
-        .format({
-            "Price": "{:.2f}", "%Chg": "{:+.2f}%",
-            "Vol Ratio": "{:.2f}x", "RSI": _fmt_rsi,
-        }, na_rep="—")
-    )
-    st.dataframe(styled_top, use_container_width=True, hide_index=True)
+    st.subheader("🔥 Volume Surge (vs 20-day avg)")
+    if vol_df.empty:
+        st.info("No unusual volume detected today.")
+    else:
+        fig_vol_top = px.bar(
+            vol_df, x="Name", y="Vol Ratio",
+            color="Vol Ratio", color_continuous_scale="Oranges",
+            text="Vol Ratio", template="plotly_dark",
+        )
+        fig_vol_top.update_traces(texttemplate="%{text:.1f}x", textposition="outside")
+        fig_vol_top.add_hline(y=2.0, line_dash="dash", line_color="red", annotation_text="2× surge")
+        fig_vol_top.update_layout(height=280, margin=dict(t=20, b=10), showlegend=False)
+        st.plotly_chart(fig_vol_top, use_container_width=True)
 
 with top_right:
     st.subheader("🚀 Top Signals (Score-ranked)")
@@ -288,20 +287,6 @@ with top_right:
         )
         st.dataframe(styled_sig, use_container_width=True, hide_index=True)
     st.caption("Scoring: RSI oversold +3 · Vol surge 2× +3 · Strong move ≥2% +2")
-
-# Volume surge bar
-if not vol_df.empty:
-    st.subheader("🔥 Volume Surge (vs 20-day avg)")
-    fig_vol_top = px.bar(
-        vol_df, x="Name", y="Vol Ratio",
-        color="Vol Ratio", color_continuous_scale="Oranges",
-        text="Vol Ratio", template="plotly_dark",
-    )
-    fig_vol_top.update_traces(texttemplate="%{text:.1f}x", textposition="outside")
-    fig_vol_top.add_hline(y=2.0, line_dash="dash", line_color="red", annotation_text="2× surge")
-    fig_vol_top.update_layout(height=260, margin=dict(t=20, b=10), showlegend=False)
-    st.plotly_chart(fig_vol_top, use_container_width=True)
-    st.caption("Red dashed line = 2× surge threshold")
 
 st.divider()
 
