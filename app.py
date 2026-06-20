@@ -127,7 +127,7 @@ def fetch_snapshot(tickers: tuple):
 def fetch_set_index():
     for ticker in ["^SET", "^SET.BK", "1290.BK"]:
         try:
-            df = yf.download(ticker, period="5d", interval="1d", progress=False, auto_adjust=True)
+            df = yf.download(ticker, period="1mo", interval="1d", progress=False, auto_adjust=True)
             if not df.empty:
                 return _flatten_cols(df)
         except Exception:
@@ -193,16 +193,19 @@ def _fmt_rsi(x):
 set_df = fetch_set_index()
 m1, m2, m3, m4 = st.columns(4)
 
-if set_df is not None and len(set_df) >= 2:
-    latest  = set_df.iloc[-1]
-    prev_r  = set_df.iloc[-2]
-    idx_chg = safe_float(latest["Close"]) - safe_float(prev_r["Close"])
-    idx_pct = idx_chg / safe_float(prev_r["Close"]) * 100
-    arrow   = "▲" if idx_chg >= 0 else "▼"
-    m1.metric("SET Index",  f"{safe_float(latest['Close']):,.2f}", f"{arrow} {idx_chg:+.2f} ({idx_pct:+.2f}%)")
+if set_df is not None and not set_df.empty:
+    latest = set_df.iloc[-1]
     m2.metric("Today High", f"{safe_float(latest['High']):,.2f}")
     m3.metric("Today Low",  f"{safe_float(latest['Low']):,.2f}")
     m4.metric("Volume (M)", f"{safe_float(latest['Volume'])/1e6:,.1f}")
+    if len(set_df) >= 2:
+        prev_r  = set_df.iloc[-2]
+        idx_chg = safe_float(latest["Close"]) - safe_float(prev_r["Close"])
+        idx_pct = idx_chg / safe_float(prev_r["Close"]) * 100
+        arrow   = "▲" if idx_chg >= 0 else "▼"
+        m1.metric("SET Index", f"{safe_float(latest['Close']):,.2f}", f"{arrow} {idx_chg:+.2f} ({idx_pct:+.2f}%)")
+    else:
+        m1.metric("SET Index", f"{safe_float(latest['Close']):,.2f}")
 else:
     m1.metric("SET Index",  "—", "Unavailable")
     m2.metric("Today High", "—")
