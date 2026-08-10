@@ -1,494 +1,499 @@
+from __future__ import annotations
+
+from datetime import datetime, time as clock_time
+from typing import Dict, Optional, Tuple
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
-from datetime import datetime
-import time
+from streamlit_autorefresh import st_autorefresh
+
 
 st.set_page_config(
-    page_title="SET Dashboard — Day Trade Scanner",
+    page_title="SET Intraday Monitor",
     page_icon="📈",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
-# ─── Stocks (top 10 most liquid SET) ─────────────────────────────────────────
-
-SET_WATCHLIST = {
-    "PTT.BK":    "PTT",
-    "KBANK.BK":  "KBANK",
-    "SCB.BK":    "SCB",
-    "AOT.BK":    "AOT",
-    "CPALL.BK":  "CPALL",
+BANGKOK = ZoneInfo("Asia/Bangkok")
+WATCHLIST = {
+    "PTT.BK": "PTT",
+    "KBANK.BK": "KBANK",
+    "SCB.BK": "SCB",
+    "AOT.BK": "AOT",
+    "CPALL.BK": "CPALL",
     "ADVANC.BK": "ADVANC",
-    "DELTA.BK":  "DELTA",
-    "GULF.BK":   "GULF",
-    "BBL.BK":    "BBL",
-    "KTC.BK":    "KTC",
+    "DELTA.BK": "DELTA",
+    "GULF.BK": "GULF",
+    "BBL.BK": "BBL",
+    "KTC.BK": "KTC",
 }
+TICKERS = tuple(WATCHLIST)
 
-TICKERS = tuple(SET_WATCHLIST.keys())
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 1rem; padding-bottom: 2rem;}
+    [data-testid="stMetric"] {background:#171d2b; border:1px solid #2b3548; padding:12px; border-radius:10px;}
+    [data-testid="stMetricLabel"] {font-size:.78rem;}
+    .signal-long {color:#33d17a; font-weight:700;}
+    .signal-short {color:#ff6b6b; font-weight:700;}
+    .signal-wait {color:#f7c948; font-weight:700;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df
+def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = out.columns.get_level_values(0)
+    return out
 
 
-def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+def safe_float(value, default=np.nan) -> float:
+    try:
+        value = float(value)
+        return default if np.isnan(value) else value
+    except (TypeError, ValueError):
+        return default
+
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
-    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
 
-def compute_macd(series: pd.Series):
-    ema12 = series.ewm(span=12, adjust=False).mean()
-    ema26 = series.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    return macd, signal
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    previous_close = df["Close"].shift(1)
+    true_range = pd.concat(
+        [
+            df["High"] - df["Low"],
+            (df["High"] - previous_close).abs(),
+            (df["Low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return true_range.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
 
-def volume_ratio(vol: pd.Series, window: int = 20) -> float:
-    if len(vol) < window + 1:
-        return 1.0
-    avg = vol.iloc[-(window + 1):-1].mean()
-    return round(float(vol.iloc[-1]) / avg, 2) if avg > 0 else 1.0
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy().dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+    out["EMA9"] = out["Close"].ewm(span=9, adjust=False).mean()
+    out["EMA21"] = out["Close"].ewm(span=21, adjust=False).mean()
+    out["RSI"] = rsi(out["Close"])
+    out["ATR"] = atr(out)
+    typical = (out["High"] + out["Low"] + out["Close"]) / 3
+    session = pd.Series(out.index.date, index=out.index)
+    cumulative_value = (typical * out["Volume"]).groupby(session).cumsum()
+    cumulative_volume = out["Volume"].groupby(session).cumsum().replace(0, np.nan)
+    out["VWAP"] = cumulative_value / cumulative_volume
+    out["Prior20High"] = out["High"].shift(1).rolling(20).max()
+    out["Prior20Low"] = out["Low"].shift(1).rolling(20).min()
+    return out
 
 
-def safe_float(val) -> float:
-    try:
-        v = float(val)
-        return v if not np.isnan(v) else np.nan
-    except Exception:
+def relative_volume(df: pd.DataFrame) -> float:
+    """Latest 15-minute bar volume versus the previous 20 bars."""
+    if len(df) < 6:
         return np.nan
+    baseline = df["Volume"].iloc[-21:-1].replace(0, np.nan).median()
+    if pd.isna(baseline) or baseline <= 0:
+        return np.nan
+    return safe_float(df["Volume"].iloc[-1] / baseline)
 
 
-@st.cache_data(ttl=300)
-def fetch_ticker_data(ticker: str, period: str = "5d", interval: str = "15m"):
+@st.cache_data(ttl=120, show_spinner=False)
+def download_intraday(ticker: str, interval: str = "15m", period: str = "5d"):
     try:
-        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-        if df.empty:
+        data = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+            timeout=12,
+        )
+        if data.empty:
             return None
-        df = _flatten_cols(df)
-        df.index = pd.to_datetime(df.index)
-        return df
+        data = flatten_columns(data)
+        data.index = pd.to_datetime(data.index)
+        if data.index.tz is None:
+            data.index = data.index.tz_localize("UTC")
+        data.index = data.index.tz_convert(BANGKOK)
+        return data
     except Exception:
         return None
 
 
-@st.cache_data(ttl=300)
-def fetch_snapshot(tickers: tuple):
-    rows = []
-    for sym in tickers:
+@st.cache_data(ttl=300, show_spinner=False)
+def download_set_index():
+    # Yahoo's Thailand SET Composite symbol is ^SET.BK. Do not accept ^SET,
+    # which can resolve to a different index.
+    for symbol in ("^SET.BK", "SET.BK"):
         try:
-            df = yf.download(sym, period="60d", interval="1d", progress=False, auto_adjust=True)
-            if df.empty or len(df) < 2:
-                continue
-            df = _flatten_cols(df)
-            today = df.iloc[-1]
-            prev  = df.iloc[-2]
-            close = safe_float(today["Close"])
-            prev_close = safe_float(prev["Close"])
-            if np.isnan(close) or np.isnan(prev_close) or prev_close == 0:
-                continue
-            chg = close - prev_close
-            pct = chg / prev_close * 100
-            vr  = volume_ratio(df["Volume"])
-            rsi_s = compute_rsi(df["Close"])
-            rsi   = safe_float(rsi_s.iloc[-1]) if len(rsi_s) else np.nan
-            rows.append({
-                "Ticker":    sym,
-                "Name":      SET_WATCHLIST.get(sym, sym),
-                "Price":     round(close, 2),
-                "Chg":       round(chg, 2),
-                "%Chg":      round(pct, 2),
-                "Volume":    int(safe_float(today["Volume"]) or 0),
-                "Vol Ratio": vr,
-                "RSI":       round(rsi, 1) if not np.isnan(rsi) else np.nan,
-                "Open":      round(safe_float(today["Open"]), 2),
-                "High":      round(safe_float(today["High"]), 2),
-                "Low":       round(safe_float(today["Low"]),  2),
-            })
-        except Exception:
-            continue
-    return pd.DataFrame(rows)
-
-
-@st.cache_data(ttl=600)
-def fetch_set_index():
-    for ticker in ["^SET", "^SET.BK", "1290.BK"]:
-        try:
-            df = yf.download(ticker, period="1mo", interval="1d", progress=False, auto_adjust=True)
-            if not df.empty:
-                return _flatten_cols(df)
+            data = yf.download(
+                symbol,
+                period="1mo",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+                timeout=12,
+            )
+            if not data.empty:
+                return flatten_columns(data)
         except Exception:
             continue
     return None
 
 
-# ─── Style helpers ────────────────────────────────────────────────────────────
-
-def colour_pct(val):
-    try:
-        v = float(val)
-        if np.isnan(v): return ""
-        if v > 0: return "color: #26a69a; font-weight:bold"
-        if v < 0: return "color: #ef5350; font-weight:bold"
-    except Exception:
-        pass
-    return ""
-
-
-def colour_rsi(val):
-    try:
-        v = float(val)
-        if np.isnan(v): return ""
-        if v >= 70: return "color: #ef5350; font-weight:bold"
-        if v <= 30: return "color: #26a69a; font-weight:bold"
-    except Exception:
-        pass
-    return ""
+def market_state(now: datetime) -> Tuple[str, str]:
+    if now.weekday() >= 5:
+        return "Closed", "#ff6b6b"
+    current = now.time()
+    morning = clock_time(10, 0) <= current <= clock_time(12, 30)
+    afternoon = clock_time(14, 0) <= current <= clock_time(16, 30)
+    preopen_1 = clock_time(9, 30) <= current < clock_time(10, 0)
+    intermission = clock_time(12, 30) < current < clock_time(13, 30)
+    preopen_2 = clock_time(13, 30) <= current < clock_time(14, 0)
+    preclose = clock_time(16, 30) < current <= clock_time(16, 40)
+    if morning or afternoon:
+        return "Open", "#33d17a"
+    if preopen_1 or preopen_2:
+        return "Pre-open", "#f7c948"
+    if intermission:
+        return "Intermission", "#f7c948"
+    if preclose:
+        return "Pre-close", "#f7c948"
+    return "Closed", "#ff6b6b"
 
 
-def colour_vr(val):
-    try:
-        if float(val) >= 2.0:
-            return "color: #ff9800; font-weight:bold"
-    except Exception:
-        pass
-    return ""
+def score_setup(symbol: str, raw: pd.DataFrame) -> Optional[Dict]:
+    data = add_indicators(raw)
+    if len(data) < 25:
+        return None
 
+    last = data.iloc[-1]
+    previous = data.iloc[-2]
+    price = safe_float(last["Close"])
+    ema9 = safe_float(last["EMA9"])
+    ema21 = safe_float(last["EMA21"])
+    vwap = safe_float(last["VWAP"])
+    rsi_value = safe_float(last["RSI"])
+    atr_value = safe_float(last["ATR"], price * 0.01)
+    rel_vol = relative_volume(data)
+    prior_high = safe_float(last["Prior20High"])
+    prior_low = safe_float(last["Prior20Low"])
 
-def colour_score(val):
-    try:
-        v = int(val)
-        if v >= 7: return "background-color: #b71c1c; color: #fff; font-weight:bold"
-        if v >= 5: return "background-color: #e65100; color: #fff; font-weight:bold"
-        if v >= 3: return "background-color: #f9a825; color: #000; font-weight:bold"
-    except Exception:
-        pass
-    return ""
+    long_points = 0
+    short_points = 0
+    long_reasons: list[str] = []
+    short_reasons: list[str] = []
 
+    if price > vwap:
+        long_points += 2
+        long_reasons.append("Above VWAP")
+    elif price < vwap:
+        short_points += 2
+        short_reasons.append("Below VWAP")
 
-def _fmt_rsi(x):
-    try:
-        v = float(x)
-        return "—" if np.isnan(v) else f"{v:.1f}"
-    except Exception:
-        return "—"
+    if ema9 > ema21 and price > ema9:
+        long_points += 2
+        long_reasons.append("EMA bullish")
+    elif ema9 < ema21 and price < ema9:
+        short_points += 2
+        short_reasons.append("EMA bearish")
 
+    if 52 <= rsi_value <= 68:
+        long_points += 1
+        long_reasons.append("RSI momentum")
+    elif 32 <= rsi_value <= 48:
+        short_points += 1
+        short_reasons.append("RSI weakness")
 
-# ─── Layout ───────────────────────────────────────────────────────────────────
+    if not np.isnan(rel_vol):
+        if rel_vol >= 2:
+            long_points += 2
+            short_points += 2
+        elif rel_vol >= 1.3:
+            long_points += 1
+            short_points += 1
 
-# SET Index — very first thing on the page (always render 4 cards)
-set_df = fetch_set_index()
-m1, m2, m3, m4 = st.columns(4)
+    breakout_up = not np.isnan(prior_high) and price >= prior_high * 0.998
+    breakout_down = not np.isnan(prior_low) and price <= prior_low * 1.002
+    if breakout_up:
+        long_points += 2
+        long_reasons.append("20-bar breakout")
+    if breakout_down:
+        short_points += 2
+        short_reasons.append("20-bar breakdown")
 
-if set_df is not None and not set_df.empty:
-    latest = set_df.iloc[-1]
-    m2.metric("Today High", f"{safe_float(latest['High']):,.2f}")
-    m3.metric("Today Low",  f"{safe_float(latest['Low']):,.2f}")
-    m4.metric("Volume (M)", f"{safe_float(latest['Volume'])/1e6:,.1f}")
-    if len(set_df) >= 2:
-        prev_r  = set_df.iloc[-2]
-        idx_chg = safe_float(latest["Close"]) - safe_float(prev_r["Close"])
-        idx_pct = idx_chg / safe_float(prev_r["Close"]) * 100
-        arrow   = "▲" if idx_chg >= 0 else "▼"
-        m1.metric("SET Index", f"{safe_float(latest['Close']):,.2f}", f"{arrow} {idx_chg:+.2f} ({idx_pct:+.2f}%)")
+    bar_change = (price / safe_float(previous["Close"]) - 1) * 100
+    if bar_change >= 0.35:
+        long_points += 1
+        long_reasons.append("Fast momentum")
+    elif bar_change <= -0.35:
+        short_points += 1
+        short_reasons.append("Fast momentum")
+
+    if long_points >= short_points + 2 and long_points >= 5:
+        direction = "WATCH LONG"
+        score = long_points
+        reasons = long_reasons
+        trigger = max(price, safe_float(data["High"].iloc[-3:].max()))
+        risk = max(atr_value * 0.8, price * 0.004)
+        stop = trigger - risk
+        target = trigger + risk * 1.8
+    elif short_points >= long_points + 2 and short_points >= 5:
+        direction = "WATCH SHORT"
+        score = short_points
+        reasons = short_reasons
+        trigger = min(price, safe_float(data["Low"].iloc[-3:].min()))
+        risk = max(atr_value * 0.8, price * 0.004)
+        stop = trigger + risk
+        target = trigger - risk * 1.8
     else:
-        m1.metric("SET Index", f"{safe_float(latest['Close']):,.2f}")
-else:
-    m1.metric("SET Index",  "—", "Unavailable")
-    m2.metric("Today High", "—")
-    m3.metric("Today Low",  "—")
-    m4.metric("Volume (M)", "—")
+        direction = "WAIT"
+        score = max(long_points, short_points)
+        reasons = long_reasons if long_points >= short_points else short_reasons
+        trigger = np.nan
+        stop = np.nan
+        target = np.nan
 
-st.divider()
+    return {
+        "Ticker": symbol,
+        "Stock": WATCHLIST[symbol],
+        "Direction": direction,
+        "Score": min(score, 10),
+        "Price": price,
+        "15m %": bar_change,
+        "Rel Volume": rel_vol,
+        "RSI": rsi_value,
+        "VWAP": vwap,
+        "Trigger": trigger,
+        "Stop": stop,
+        "Target": target,
+        "Setup": " · ".join(reasons[:3]) if reasons else "No confirmation",
+        "Updated": data.index[-1],
+    }
 
-# Title + controls below the metrics
-hdr, ctrl1, ctrl2 = st.columns([3, 1, 1])
-with hdr:
-    st.markdown("### 📈 SET Day-Trade Dashboard")
-    st.caption(f"Thailand Stock Exchange  •  Yahoo Finance  •  {datetime.now().strftime('%H:%M:%S ICT')}")
-with ctrl1:
-    auto_refresh = st.checkbox("Auto-refresh (5 min)", value=False)
-with ctrl2:
-    if st.button("🔄 Refresh Now"):
+
+@st.cache_data(ttl=120, show_spinner=False)
+def build_monitor(tickers: tuple[str, ...]):
+    rows = []
+    histories = {}
+    for ticker in tickers:
+        data = download_intraday(ticker)
+        if data is None:
+            continue
+        result = score_setup(ticker, data)
+        if result:
+            rows.append(result)
+            histories[ticker] = data
+    frame = pd.DataFrame(rows)
+    if not frame.empty:
+        direction_order = {"WATCH LONG": 0, "WATCH SHORT": 1, "WAIT": 2}
+        frame["_direction_order"] = frame["Direction"].map(direction_order)
+        frame = frame.sort_values(["_direction_order", "Score", "Rel Volume"], ascending=[True, False, False])
+        frame = frame.drop(columns="_direction_order").reset_index(drop=True)
+        frame.insert(0, "Rank", np.arange(1, len(frame) + 1))
+    return frame, histories
+
+
+def direction_style(value: str) -> str:
+    if value == "WATCH LONG":
+        return "color:#33d17a;font-weight:700"
+    if value == "WATCH SHORT":
+        return "color:#ff6b6b;font-weight:700"
+    return "color:#f7c948;font-weight:700"
+
+
+def score_style(value) -> str:
+    score = safe_float(value, 0)
+    if score >= 7:
+        return "background-color:#9f1239;color:white;font-weight:700"
+    if score >= 5:
+        return "background-color:#c2410c;color:white;font-weight:700"
+    return "background-color:#854d0e;color:white"
+
+
+def fmt_number(value, decimals=2, suffix=""):
+    value = safe_float(value)
+    return "—" if np.isnan(value) else f"{value:,.{decimals}f}{suffix}"
+
+
+now = datetime.now(BANGKOK)
+state, state_color = market_state(now)
+index_data = download_set_index()
+
+index_close = index_high = index_low = index_delta = np.nan
+if index_data is not None and not index_data.empty:
+    index_close = safe_float(index_data["Close"].iloc[-1])
+    index_high = safe_float(index_data["High"].iloc[-1])
+    index_low = safe_float(index_data["Low"].iloc[-1])
+    if len(index_data) > 1:
+        previous_close = safe_float(index_data["Close"].iloc[-2])
+        if previous_close:
+            index_delta = (index_close / previous_close - 1) * 100
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("SET Index", fmt_number(index_close), None if np.isnan(index_delta) else f"{index_delta:+.2f}%")
+m2.metric("Today High", fmt_number(index_high))
+m3.metric("Today Low", fmt_number(index_low))
+m4.markdown(
+    f"<div style='padding:8px 0'><small>MARKET STATUS</small><br>"
+    f"<span style='font-size:1.8rem;color:{state_color};font-weight:700'>{state}</span></div>",
+    unsafe_allow_html=True,
+)
+
+header, refresh_col = st.columns([4, 1])
+with header:
+    st.title("SET Intraday Opportunity Monitor")
+    st.caption(f"15-minute signals · Updated {now:%d %b %Y, %H:%M} ICT · Data: Yahoo Finance (may be delayed)")
+with refresh_col:
+    auto_refresh = st.toggle("Auto-refresh", value=False)
+    if st.button("↻ Refresh", width="stretch"):
         st.cache_data.clear()
         st.rerun()
 
-st.divider()
+if auto_refresh:
+    st_autorefresh(interval=120_000, key="market-refresh")
 
-# ─── Fetch data ───────────────────────────────────────────────────────────────
+with st.spinner("Scanning 10 liquid SET stocks…"):
+    monitor, histories = build_monitor(TICKERS)
 
-with st.spinner("Loading market data…"):
-    snap = fetch_snapshot(TICKERS)
-
-if snap.empty:
-    st.error("Could not fetch data. Check internet connection.")
+if monitor.empty:
+    st.error("Market data is temporarily unavailable. Try Refresh again in a minute.")
     st.stop()
 
-# ─── Pre-compute opportunity scores (used in top summary + tab2) ──────────────
+actionable = monitor[monitor["Direction"] != "WAIT"]
+best = actionable.iloc[0] if not actionable.empty else monitor.iloc[0]
 
-def build_scores(df):
-    out = df.copy()
-    out["Signal"] = "Neutral"
-    out["Score"]  = 0
-    for i, row in out.iterrows():
-        score, signals = 0, []
-        rsi = row["RSI"]
-        vr  = row["Vol Ratio"]
-        pct = row["%Chg"]
-        rsi_ok = isinstance(rsi, (int, float)) and not np.isnan(float(rsi))
-        if rsi_ok:
-            if rsi <= 35:   score += 3; signals.append("RSI oversold")
-            elif rsi >= 65: score += 2; signals.append("RSI overbought")
-        if vr >= 2.0:       score += 3; signals.append(f"Vol {vr:.1f}x")
-        elif vr >= 1.5:     score += 1; signals.append(f"Vol {vr:.1f}x")
-        if pct >= 2.0:      score += 2; signals.append("Strong up")
-        elif pct <= -2.0:   score += 2; signals.append("Strong down")
-        out.at[i, "Score"]  = score
-        out.at[i, "Signal"] = " | ".join(signals) if signals else "Neutral"
-    return out
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Stocks scanned", len(monitor))
+k2.metric("Actionable setups", len(actionable))
+k3.metric("Highest score", f"{int(best['Score'])}/10", best["Stock"])
+k4.metric("Best relative volume", fmt_number(monitor["Rel Volume"].max(), 1, "×"))
 
-df_scored = build_scores(snap)
-df_opp    = df_scored[df_scored["Score"] > 0].sort_values("Score", ascending=False)
-vol_df    = snap[snap["Vol Ratio"] >= 1.3].sort_values("Vol Ratio", ascending=False)
+st.subheader("Stocks to monitor now")
+display_columns = [
+    "Rank", "Stock", "Direction", "Score", "Price", "15m %", "Rel Volume",
+    "RSI", "Trigger", "Stop", "Target", "Setup",
+]
+styled = (
+    monitor[display_columns]
+    .style.map(direction_style, subset=["Direction"])
+    .map(score_style, subset=["Score"])
+    .format(
+        {
+            "Price": "{:.2f}",
+            "15m %": "{:+.2f}%",
+            "Rel Volume": "{:.1f}×",
+            "RSI": "{:.0f}",
+            "Trigger": "{:.2f}",
+            "Stop": "{:.2f}",
+            "Target": "{:.2f}",
+        },
+        na_rep="—",
+    )
+)
+st.dataframe(styled, width="stretch", hide_index=True, height=425)
+st.caption("A setup is actionable only after price crosses its Trigger. Stop and Target are volatility-based planning levels, not guaranteed prices.")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TOP SUMMARY — always visible above tabs
-# ═══════════════════════════════════════════════════════════════════════════════
+left, right = st.columns([1.1, 1])
+with left:
+    st.subheader("Signal strength")
+    signal_chart = px.bar(
+        monitor.sort_values("Score"),
+        x="Score",
+        y="Stock",
+        orientation="h",
+        color="Direction",
+        color_discrete_map={"WATCH LONG": "#33d17a", "WATCH SHORT": "#ff6b6b", "WAIT": "#f7c948"},
+        hover_data=["Setup", "Rel Volume", "RSI"],
+        template="plotly_dark",
+    )
+    signal_chart.update_layout(height=350, margin=dict(l=10, r=10, t=10, b=10), xaxis_range=[0, 10])
+    st.plotly_chart(signal_chart)
 
-top_left, top_right = st.columns(2)
-
-with top_left:
-    st.subheader("🔥 Volume Surge (vs 20-day avg)")
-    if vol_df.empty:
-        st.info("No unusual volume detected today.")
-    else:
-        fig_vol_top = px.bar(
-            vol_df, x="Name", y="Vol Ratio",
-            color="Vol Ratio", color_continuous_scale="Oranges",
-            text="Vol Ratio", template="plotly_dark",
-        )
-        fig_vol_top.update_traces(texttemplate="%{text:.1f}x", textposition="outside")
-        fig_vol_top.add_hline(y=2.0, line_dash="dash", line_color="red", annotation_text="2× surge")
-        fig_vol_top.update_layout(height=280, margin=dict(t=20, b=10), showlegend=False)
-        st.plotly_chart(fig_vol_top, use_container_width=True)
-
-with top_right:
-    st.subheader("🚀 Top Signals (Score-ranked)")
-    if df_opp.empty:
-        st.info("No strong signals right now.")
-    else:
-        styled_sig = (
-            df_opp[["Name", "Score", "Signal"]]
-            .style
-            .map(colour_score, subset=["Score"])
-        )
-        st.dataframe(styled_sig, use_container_width=True, hide_index=True)
-    st.caption("Scoring: RSI oversold +3 · Vol surge 2× +3 · Strong move ≥2% +2")
+with right:
+    st.subheader("Volume versus momentum")
+    scatter = px.scatter(
+        monitor,
+        x="Rel Volume",
+        y="15m %",
+        text="Stock",
+        color="Direction",
+        size="Score",
+        color_discrete_map={"WATCH LONG": "#33d17a", "WATCH SHORT": "#ff6b6b", "WAIT": "#f7c948"},
+        template="plotly_dark",
+    )
+    scatter.add_vline(x=1.3, line_dash="dash", line_color="#ff9f43")
+    scatter.add_hline(y=0, line_dash="dot", line_color="#718096")
+    scatter.update_traces(textposition="top center")
+    scatter.update_layout(height=350, margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(scatter)
 
 st.divider()
+st.subheader("Intraday chart")
+selected_name = st.selectbox("Stock", monitor["Stock"].tolist(), index=0)
+selected_ticker = monitor.loc[monitor["Stock"] == selected_name, "Ticker"].iloc[0]
+chart_data = add_indicators(histories[selected_ticker])
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TABS — detailed analysis
-# ═══════════════════════════════════════════════════════════════════════════════
+figure = make_subplots(
+    rows=3,
+    cols=1,
+    shared_xaxes=True,
+    row_heights=[0.58, 0.22, 0.20],
+    vertical_spacing=0.04,
+)
+figure.add_trace(
+    go.Candlestick(
+        x=chart_data.index,
+        open=chart_data["Open"], high=chart_data["High"],
+        low=chart_data["Low"], close=chart_data["Close"],
+        increasing_line_color="#33d17a", decreasing_line_color="#ff6b6b", name="Price",
+    ),
+    row=1, col=1,
+)
+for column, colour in (("EMA9", "#f7c948"), ("EMA21", "#a78bfa"), ("VWAP", "#38bdf8")):
+    figure.add_trace(go.Scatter(x=chart_data.index, y=chart_data[column], name=column, line=dict(color=colour, width=1.3)), row=1, col=1)
+figure.add_trace(go.Bar(x=chart_data.index, y=chart_data["Volume"], name="Volume", marker_color="#64748b"), row=2, col=1)
+figure.add_trace(go.Scatter(x=chart_data.index, y=chart_data["RSI"], name="RSI", line=dict(color="#38bdf8")), row=3, col=1)
+figure.add_hline(y=70, line_dash="dash", line_color="#ff6b6b", row=3, col=1)
+figure.add_hline(y=30, line_dash="dash", line_color="#33d17a", row=3, col=1)
+figure.update_layout(
+    height=760,
+    template="plotly_dark",
+    xaxis_rangeslider_visible=False,
+    legend=dict(orientation="h", y=1.03),
+    margin=dict(t=35, b=10),
+)
+st.plotly_chart(figure)
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📊 Market Overview", "🚀 Opportunity Scanner", "🔥 Volume Alert", "📉 Chart Viewer"
-])
+with st.expander("How the monitor ranks stocks"):
+    st.markdown(
+        """
+        The monitor gives separate long and short points. It looks for price relative to VWAP,
+        EMA9/EMA21 trend alignment, RSI momentum, unusual 15-minute volume, a 20-bar breakout
+        or breakdown, and fast price movement. A stock becomes **WATCH LONG** or **WATCH SHORT**
+        only when one direction scores at least 5 and clearly exceeds the opposite direction.
 
-# ══════════════════════════════════════════════════════════════════════════════
-with tab1:
-    st.subheader("Top 10 SET Stocks — Full Detail")
-
-    styled = (
-        snap[["Name", "Price", "Chg", "%Chg", "Open", "High", "Low", "Volume", "Vol Ratio", "RSI"]]
-        .sort_values("%Chg", ascending=False)
-        .style
-        .map(colour_pct, subset=["%Chg", "Chg"])
-        .map(colour_rsi, subset=["RSI"])
-        .map(colour_vr,  subset=["Vol Ratio"])
-        .format({
-            "Price": "{:.2f}", "Chg": "{:+.2f}", "%Chg": "{:+.2f}%",
-            "Open": "{:.2f}", "High": "{:.2f}", "Low": "{:.2f}",
-            "Volume": "{:,.0f}", "Vol Ratio": "{:.2f}x", "RSI": _fmt_rsi,
-        }, na_rep="—")
+        This dashboard is a screening and monitoring tool. Yahoo Finance data can be delayed and
+        should not be used as the sole source for order execution or investment decisions.
+        """
     )
-    st.dataframe(styled, use_container_width=True, height=420, hide_index=True)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        g = snap.nlargest(5, "%Chg")[["Name", "%Chg"]]
-        fig = px.bar(g, x="Name", y="%Chg", color="%Chg",
-                     color_continuous_scale=["#ef5350", "#26a69a"],
-                     title="Top 5 Gainers (%)", template="plotly_dark")
-        st.plotly_chart(fig, use_container_width=True)
-    with c2:
-        l = snap.nsmallest(5, "%Chg")[["Name", "%Chg"]]
-        fig2 = px.bar(l, x="Name", y="%Chg", color="%Chg",
-                      color_continuous_scale=["#ef5350", "#26a69a"],
-                      title="Top 5 Losers (%)", template="plotly_dark")
-        st.plotly_chart(fig2, use_container_width=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-with tab2:
-    st.subheader("🚀 Day Trade Opportunity Scanner")
-    st.caption("Scores each stock by RSI + Volume surge + Momentum")
-
-    if df_opp.empty:
-        st.info("No strong signals right now. Market may be calm.")
-    else:
-        st.dataframe(
-            df_opp[["Name", "Price", "%Chg", "RSI", "Vol Ratio", "Score", "Signal"]]
-            .style
-            .map(colour_pct,   subset=["%Chg"])
-            .map(colour_rsi,   subset=["RSI"])
-            .map(colour_score, subset=["Score"])
-            .format({
-                "Price": "{:.2f}", "%Chg": "{:+.2f}%",
-                "RSI": _fmt_rsi, "Vol Ratio": "{:.2f}x",
-            }, na_rep="—"),
-            use_container_width=True, hide_index=True,
-        )
-
-    st.subheader("RSI vs % Change Map")
-    fig_sc = px.scatter(
-        snap.dropna(subset=["RSI"]),
-        x="RSI", y="%Chg", text="Name", color="%Chg",
-        color_continuous_scale="RdYlGn", size="Volume", size_max=30,
-        template="plotly_dark",
-        labels={"RSI": "RSI (14)", "%Chg": "Daily % Change"},
-    )
-    fig_sc.add_vline(x=70, line_dash="dash", line_color="red",   annotation_text="Overbought")
-    fig_sc.add_vline(x=30, line_dash="dash", line_color="green", annotation_text="Oversold")
-    fig_sc.add_hline(y=0,  line_dash="dot",  line_color="gray")
-    fig_sc.update_traces(textposition="top center", textfont_size=10)
-    st.plotly_chart(fig_sc, use_container_width=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-with tab3:
-    st.subheader("🔥 Volume Surge Alert")
-    st.caption("Stocks trading above their 20-day average volume")
-
-    if vol_df.empty:
-        st.info("No unusual volume detected today.")
-    else:
-        fig_vol = px.bar(
-            vol_df, x="Name", y="Vol Ratio",
-            color="Vol Ratio", color_continuous_scale="Oranges",
-            text="Vol Ratio", title="Volume vs 20-Day Average",
-            template="plotly_dark",
-        )
-        fig_vol.update_traces(texttemplate="%{text:.1f}x", textposition="outside")
-        fig_vol.add_hline(y=2.0, line_dash="dash", line_color="red", annotation_text="2× surge")
-        st.plotly_chart(fig_vol, use_container_width=True)
-
-        st.dataframe(
-            vol_df[["Name", "Price", "%Chg", "Volume", "Vol Ratio", "RSI"]]
-            .style
-            .map(colour_pct, subset=["%Chg"])
-            .map(colour_vr,  subset=["Vol Ratio"])
-            .format({
-                "Price": "{:.2f}", "%Chg": "{:+.2f}%",
-                "Volume": "{:,.0f}", "Vol Ratio": "{:.2f}x", "RSI": _fmt_rsi,
-            }, na_rep="—"),
-            use_container_width=True, hide_index=True,
-        )
-
-# ══════════════════════════════════════════════════════════════════════════════
-with tab4:
-    st.subheader("📉 Intraday Chart Viewer")
-
-    col_a, _ = st.columns([1, 2])
-    with col_a:
-        sel_name = st.selectbox("Select Stock", options=list(SET_WATCHLIST.values()))
-        sel_tick = [k for k, v in SET_WATCHLIST.items() if v == sel_name][0]
-        interval = st.radio("Interval", ["15m", "30m", "1h", "1d"], horizontal=True)
-        period   = "5d" if interval in ["15m", "30m", "1h"] else "3mo"
-
-    with st.spinner(f"Loading {sel_tick}…"):
-        df_chart = fetch_ticker_data(sel_tick, period=period, interval=interval)
-
-    if df_chart is None or df_chart.empty:
-        st.error(f"No data for {sel_tick}")
-    else:
-        df_chart["RSI"]         = compute_rsi(df_chart["Close"])
-        df_chart["MACD"], df_chart["Signal_line"] = compute_macd(df_chart["Close"])
-        df_chart["EMA9"]        = df_chart["Close"].ewm(span=9,  adjust=False).mean()
-        df_chart["EMA21"]       = df_chart["Close"].ewm(span=21, adjust=False).mean()
-
-        fig = make_subplots(
-            rows=3, cols=1, shared_xaxes=True,
-            row_heights=[0.55, 0.25, 0.20],
-            vertical_spacing=0.04,
-            subplot_titles=[f"{sel_name} — Candle + EMA", "RSI (14)", "MACD"],
-        )
-
-        fig.add_trace(go.Candlestick(
-            x=df_chart.index,
-            open=df_chart["Open"], high=df_chart["High"],
-            low=df_chart["Low"],   close=df_chart["Close"],
-            name="Price",
-            increasing_line_color="#26a69a",
-            decreasing_line_color="#ef5350",
-        ), row=1, col=1)
-
-        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart["EMA9"],
-                                  name="EMA9",  line=dict(color="#f9a825", width=1.2)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart["EMA21"],
-                                  name="EMA21", line=dict(color="#ab47bc", width=1.2)), row=1, col=1)
-
-        bar_colours = ["#26a69a" if c >= o else "#ef5350"
-                       for c, o in zip(df_chart["Close"], df_chart["Open"])]
-        fig.add_trace(go.Bar(x=df_chart.index, y=df_chart["Volume"],
-                              marker_color=bar_colours, opacity=0.35, name="Volume"), row=1, col=1)
-
-        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart["RSI"],
-                                  name="RSI", line=dict(color="#29b6f6", width=1.5)), row=2, col=1)
-        fig.add_hline(y=70, line_dash="dash", line_color="red",   row=2, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
-
-        hist = df_chart["MACD"] - df_chart["Signal_line"]
-        fig.add_trace(go.Bar(x=df_chart.index, y=hist,
-                              marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in hist],
-                              opacity=0.7, name="Histogram"), row=3, col=1)
-        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart["MACD"],
-                                  name="MACD",   line=dict(color="#f06292", width=1.5)), row=3, col=1)
-        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart["Signal_line"],
-                                  name="Signal", line=dict(color="#ffcc02", width=1.5)), row=3, col=1)
-
-        fig.update_layout(
-            height=800, xaxis_rangeslider_visible=False,
-            template="plotly_dark",
-            legend=dict(orientation="h", y=1.02),
-            margin=dict(t=40, b=10),
-        )
-        fig.update_yaxes(title_text="THB",  row=1, col=1)
-        fig.update_yaxes(title_text="RSI",  row=2, col=1)
-        fig.update_yaxes(title_text="MACD", row=3, col=1)
-        st.plotly_chart(fig, use_container_width=True)
-
-        last = df_chart.iloc[-1]
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Last Close", f"{safe_float(last['Close']):.2f}")
-        r2.metric("RSI",  _fmt_rsi(last["RSI"]))
-        r3.metric("EMA9",  f"{safe_float(last['EMA9']):.2f}")
-        r4.metric("EMA21", f"{safe_float(last['EMA21']):.2f}")
-
-# ─── Auto-refresh ─────────────────────────────────────────────────────────────
-
-if auto_refresh:
-    time.sleep(300)
-    st.cache_data.clear()
-    st.rerun()
