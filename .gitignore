@@ -3,3 +3,4 @@ __pycache__/
 .env
 .venv/
 run.sh
+signal_log.csv
