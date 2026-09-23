@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, time as clock_time
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -35,6 +36,12 @@ WATCHLIST = {
     "KTC.BK": "KTC",
 }
 TICKERS = tuple(WATCHLIST)
+SIGNAL_LOG_PATH = Path(__file__).with_name("signal_log.csv")
+LOG_COLUMNS = [
+    "Logged At", "Bar Time", "Stock", "Ticker", "Signal", "Score", "Price",
+    "Trigger", "Stop", "Target", "Daily", "1H", "15m Setup", "5m Confirm",
+    "Rel Volume", "RSI", "Setup",
+]
 
 st.markdown(
     """
@@ -115,8 +122,21 @@ def relative_volume(df: pd.DataFrame) -> float:
     return safe_float(df["Volume"].iloc[-1] / baseline)
 
 
+def completed_bars(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """Remove the currently forming intraday candle."""
+    if df.empty:
+        return df
+    last_start = pd.Timestamp(df.index[-1])
+    now = pd.Timestamp.now(tz=BANGKOK)
+    if last_start.tzinfo is None:
+        last_start = last_start.tz_localize(BANGKOK)
+    if last_start + pd.Timedelta(minutes=minutes) > now:
+        return df.iloc[:-1]
+    return df
+
+
 @st.cache_data(ttl=120, show_spinner=False)
-def download_intraday(ticker: str, interval: str = "15m", period: str = "5d"):
+def download_prices(ticker: str, interval: str, period: str):
     try:
         data = yf.download(
             ticker,
@@ -137,6 +157,31 @@ def download_intraday(ticker: str, interval: str = "15m", period: str = "5d"):
         return data
     except Exception:
         return None
+
+
+def timeframe_bias(raw: pd.DataFrame, timeframe: str) -> str:
+    source = completed_bars(raw, 60) if timeframe == "1H" else raw
+    data = add_indicators(source)
+    if len(data) < 22:
+        return "NEUTRAL"
+    last = data.iloc[-1]
+    close = safe_float(last["Close"])
+    if timeframe == "1D":
+        ema20 = data["Close"].ewm(span=20, adjust=False).mean()
+        slope = safe_float(ema20.iloc[-1] - ema20.iloc[-4])
+        if close > safe_float(ema20.iloc[-1]) and slope > 0:
+            return "BULLISH"
+        if close < safe_float(ema20.iloc[-1]) and slope < 0:
+            return "BEARISH"
+        return "NEUTRAL"
+    ema9 = safe_float(last["EMA9"])
+    ema21 = safe_float(last["EMA21"])
+    rsi_value = safe_float(last["RSI"])
+    if close > ema9 > ema21 and rsi_value >= 50:
+        return "BULLISH"
+    if close < ema9 < ema21 and rsi_value <= 50:
+        return "BEARISH"
+    return "NEUTRAL"
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -183,7 +228,7 @@ def market_state(now: datetime) -> Tuple[str, str]:
 
 
 def score_setup(symbol: str, raw: pd.DataFrame) -> Optional[Dict]:
-    data = add_indicators(raw)
+    data = add_indicators(completed_bars(raw, 15))
     if len(data) < 25:
         return None
 
@@ -292,32 +337,125 @@ def score_setup(symbol: str, raw: pd.DataFrame) -> Optional[Dict]:
     }
 
 
+def five_minute_confirmation(raw: pd.DataFrame, direction: str, trigger: float) -> Tuple[str, bool]:
+    data = add_indicators(completed_bars(raw, 5))
+    if len(data) < 22 or np.isnan(trigger):
+        return "WAIT", False
+    last, previous = data.iloc[-1], data.iloc[-2]
+    close = safe_float(last["Close"])
+    previous_close = safe_float(previous["Close"])
+    open_price = safe_float(last["Open"])
+    rel_vol = relative_volume(data)
+    volume_ok = not np.isnan(rel_vol) and rel_vol >= 1.2
+    if direction == "WATCH LONG":
+        crossed = previous_close < trigger <= close
+        if crossed and close > open_price and volume_ok:
+            return "BREAKOUT", True
+        return ("ABOVE" if close >= trigger else "BELOW"), False
+    if direction == "WATCH SHORT":
+        crossed = previous_close > trigger >= close
+        if crossed and close < open_price and volume_ok:
+            return "BREAKDOWN", True
+        return ("BELOW" if close <= trigger else "ABOVE"), False
+    return "WAIT", False
+
+
+def final_signal(setup: str, daily: str, hourly: str, confirmed: bool) -> str:
+    if setup == "WATCH LONG":
+        if daily == "BEARISH" or hourly == "BEARISH":
+            return "CONFLICT"
+        if daily == hourly == "BULLISH":
+            return "BUY NOW" if confirmed else "ARMED LONG"
+        return "WATCH LONG"
+    if setup == "WATCH SHORT":
+        if daily == "BULLISH" or hourly == "BULLISH":
+            return "CONFLICT"
+        if daily == hourly == "BEARISH":
+            return "SELL NOW" if confirmed else "ARMED SHORT"
+        return "WATCH SHORT"
+    return "WAIT"
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def build_monitor(tickers: tuple[str, ...]):
-    rows = []
-    histories = {}
+    rows, histories = [], {}
     for ticker in tickers:
-        data = download_intraday(ticker)
-        if data is None:
+        daily = download_prices(ticker, "1d", "6mo")
+        hourly = download_prices(ticker, "1h", "1mo")
+        setup_data = download_prices(ticker, "15m", "5d")
+        trigger_data = download_prices(ticker, "5m", "5d")
+        if any(item is None for item in (daily, hourly, setup_data, trigger_data)):
             continue
-        result = score_setup(ticker, data)
-        if result:
-            rows.append(result)
-            histories[ticker] = data
+        result = score_setup(ticker, setup_data)
+        if not result:
+            continue
+        daily_bias = timeframe_bias(daily, "1D")
+        hourly_bias = timeframe_bias(hourly, "1H")
+        confirm_text, confirmed = five_minute_confirmation(
+            trigger_data, result["Direction"], safe_float(result["Trigger"])
+        )
+        result.update({
+            "15m Setup": result["Direction"], "Daily": daily_bias, "1H": hourly_bias,
+            "5m Confirm": confirm_text,
+            "Signal": final_signal(result["Direction"], daily_bias, hourly_bias, confirmed),
+            "Bar Time": completed_bars(trigger_data, 5).index[-1],
+        })
+        rows.append(result)
+        histories[ticker] = setup_data
     frame = pd.DataFrame(rows)
     if not frame.empty:
-        direction_order = {"WATCH LONG": 0, "WATCH SHORT": 1, "WAIT": 2}
-        frame["_direction_order"] = frame["Direction"].map(direction_order)
-        frame = frame.sort_values(["_direction_order", "Score", "Rel Volume"], ascending=[True, False, False])
-        frame = frame.drop(columns="_direction_order").reset_index(drop=True)
+        order = {
+            "BUY NOW": 0, "SELL NOW": 0, "ARMED LONG": 1, "ARMED SHORT": 1,
+            "WATCH LONG": 2, "WATCH SHORT": 2, "CONFLICT": 3, "WAIT": 4,
+        }
+        frame["_order"] = frame["Signal"].map(order)
+        frame = frame.sort_values(["_order", "Score", "Rel Volume"], ascending=[True, False, False])
+        frame = frame.drop(columns="_order").reset_index(drop=True)
         frame.insert(0, "Rank", np.arange(1, len(frame) + 1))
     return frame, histories
 
 
+def load_signal_log() -> pd.DataFrame:
+    if not SIGNAL_LOG_PATH.exists():
+        return pd.DataFrame(columns=LOG_COLUMNS)
+    try:
+        return pd.read_csv(SIGNAL_LOG_PATH)
+    except Exception:
+        return pd.DataFrame(columns=LOG_COLUMNS)
+
+
+def record_signals(frame: pd.DataFrame, logged_at: datetime) -> pd.DataFrame:
+    existing = load_signal_log()
+    loggable = frame[frame["Signal"].isin(["ARMED LONG", "ARMED SHORT", "BUY NOW", "SELL NOW"])]
+    existing_keys = set()
+    if not existing.empty:
+        existing_keys = set(existing["Ticker"].astype(str) + "|" + existing["Bar Time"].astype(str) + "|" + existing["Signal"].astype(str))
+    records = []
+    for _, row in loggable.iterrows():
+        bar_time = pd.Timestamp(row["Bar Time"]).isoformat()
+        if f"{row['Ticker']}|{bar_time}|{row['Signal']}" in existing_keys:
+            continue
+        records.append({
+            "Logged At": logged_at.isoformat(), "Bar Time": bar_time, "Stock": row["Stock"],
+            "Ticker": row["Ticker"], "Signal": row["Signal"], "Score": row["Score"],
+            "Price": row["Price"], "Trigger": row["Trigger"], "Stop": row["Stop"],
+            "Target": row["Target"], "Daily": row["Daily"], "1H": row["1H"],
+            "15m Setup": row["15m Setup"], "5m Confirm": row["5m Confirm"],
+            "Rel Volume": row["Rel Volume"], "RSI": row["RSI"], "Setup": row["Setup"],
+        })
+    if records:
+        existing = pd.concat([existing, pd.DataFrame(records)], ignore_index=True)
+        try:
+            existing.to_csv(SIGNAL_LOG_PATH, index=False)
+        except OSError:
+            pass
+    return existing
+
+
 def direction_style(value: str) -> str:
-    if value == "WATCH LONG":
+    if value in ("BUY NOW", "ARMED LONG", "WATCH LONG", "BULLISH"):
         return "color:#33d17a;font-weight:700"
-    if value == "WATCH SHORT":
+    if value in ("SELL NOW", "ARMED SHORT", "WATCH SHORT", "BEARISH"):
         return "color:#ff6b6b;font-weight:700"
     return "color:#f7c948;font-weight:700"
 
@@ -362,8 +500,8 @@ m4.markdown(
 
 header, refresh_col = st.columns([4, 1])
 with header:
-    st.title("SET Intraday Opportunity Monitor")
-    st.caption(f"15-minute signals · Updated {now:%d %b %Y, %H:%M} ICT · Data: Yahoo Finance (may be delayed)")
+    st.title("SET Multi-Timeframe Opportunity Monitor")
+    st.caption(f"1D regime · 1H trend · 15m setup · 5m trigger · Updated {now:%d %b %Y, %H:%M} ICT")
 with refresh_col:
     auto_refresh = st.toggle("Auto-refresh", value=False)
     if st.button("↻ Refresh", width="stretch"):
@@ -380,30 +518,29 @@ if monitor.empty:
     st.error("Market data is temporarily unavailable. Try Refresh again in a minute.")
     st.stop()
 
-actionable = monitor[monitor["Direction"] != "WAIT"]
+signal_log = record_signals(monitor, now)
+actionable = monitor[monitor["Signal"].isin(["BUY NOW", "SELL NOW", "ARMED LONG", "ARMED SHORT"])]
 best = actionable.iloc[0] if not actionable.empty else monitor.iloc[0]
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Stocks scanned", len(monitor))
-k2.metric("Actionable setups", len(actionable))
+k2.metric("Armed / triggered", len(actionable))
 k3.metric("Highest score", f"{int(best['Score'])}/10", best["Stock"])
 k4.metric("Best relative volume", fmt_number(monitor["Rel Volume"].max(), 1, "×"))
 
 st.subheader("Stocks to monitor now")
 display_columns = [
-    "Rank", "Stock", "Direction", "Score", "Price", "15m %", "Rel Volume",
-    "RSI", "Trigger", "Stop", "Target", "Setup",
+    "Rank", "Stock", "Signal", "Daily", "1H", "15m Setup", "5m Confirm",
+    "Score", "Price", "Rel Volume", "Trigger", "Stop", "Target", "Setup",
 ]
 styled = (
     monitor[display_columns]
-    .style.map(direction_style, subset=["Direction"])
+    .style.map(direction_style, subset=["Signal", "Daily", "1H", "15m Setup"])
     .map(score_style, subset=["Score"])
     .format(
         {
             "Price": "{:.2f}",
-            "15m %": "{:+.2f}%",
             "Rel Volume": "{:.1f}×",
-            "RSI": "{:.0f}",
             "Trigger": "{:.2f}",
             "Stop": "{:.2f}",
             "Target": "{:.2f}",
@@ -412,7 +549,7 @@ styled = (
     )
 )
 st.dataframe(styled, width="stretch", hide_index=True, height=425)
-st.caption("A setup is actionable only after price crosses its Trigger. Stop and Target are volatility-based planning levels, not guaranteed prices.")
+st.caption("BUY/SELL NOW requires aligned 1D + 1H direction and a volume-confirmed 5-minute trigger cross. ARMED means aligned but not yet triggered.")
 
 left, right = st.columns([1.1, 1])
 with left:
@@ -422,8 +559,12 @@ with left:
         x="Score",
         y="Stock",
         orientation="h",
-        color="Direction",
-        color_discrete_map={"WATCH LONG": "#33d17a", "WATCH SHORT": "#ff6b6b", "WAIT": "#f7c948"},
+        color="Signal",
+        color_discrete_map={
+            "BUY NOW": "#00e676", "ARMED LONG": "#33d17a", "WATCH LONG": "#66bb6a",
+            "SELL NOW": "#ff1744", "ARMED SHORT": "#ff6b6b", "WATCH SHORT": "#ef5350",
+            "CONFLICT": "#ab47bc", "WAIT": "#f7c948",
+        },
         hover_data=["Setup", "Rel Volume", "RSI"],
         template="plotly_dark",
     )
@@ -437,9 +578,13 @@ with right:
         x="Rel Volume",
         y="15m %",
         text="Stock",
-        color="Direction",
+        color="Signal",
         size="Score",
-        color_discrete_map={"WATCH LONG": "#33d17a", "WATCH SHORT": "#ff6b6b", "WAIT": "#f7c948"},
+        color_discrete_map={
+            "BUY NOW": "#00e676", "ARMED LONG": "#33d17a", "WATCH LONG": "#66bb6a",
+            "SELL NOW": "#ff1744", "ARMED SHORT": "#ff6b6b", "WATCH SHORT": "#ef5350",
+            "CONFLICT": "#ab47bc", "WAIT": "#f7c948",
+        },
         template="plotly_dark",
     )
     scatter.add_vline(x=1.3, line_dash="dash", line_color="#ff9f43")
@@ -485,13 +630,27 @@ figure.update_layout(
 )
 st.plotly_chart(figure)
 
+st.divider()
+st.subheader("Signal journal")
+if signal_log.empty:
+    st.info("No aligned signals have been logged yet.")
+else:
+    st.dataframe(signal_log.tail(100).iloc[::-1], width="stretch", hide_index=True, height=320)
+    st.download_button(
+        "Download signal log (CSV)",
+        signal_log.to_csv(index=False).encode("utf-8"),
+        file_name="set_signal_log.csv",
+        mime="text/csv",
+    )
+st.caption("Community Cloud storage is temporary: download the CSV regularly. A database is required for permanent history across restarts and redeployments.")
+
 with st.expander("How the monitor ranks stocks"):
     st.markdown(
         """
-        The monitor gives separate long and short points. It looks for price relative to VWAP,
-        EMA9/EMA21 trend alignment, RSI momentum, unusual 15-minute volume, a 20-bar breakout
-        or breakdown, and fast price movement. A stock becomes **WATCH LONG** or **WATCH SHORT**
-        only when one direction scores at least 5 and clearly exceeds the opposite direction.
+        **1D** defines the broad regime from price versus EMA20 and its slope. **1H** confirms
+        direction using EMA9/EMA21 and RSI. **15m** scores VWAP, trend, RSI, relative volume,
+        breakout proximity and momentum. **5m** issues BUY/SELL NOW only after price crosses the
+        trigger with a directionally correct candle and at least 1.2× relative volume.
 
         This dashboard is a screening and monitoring tool. Yahoo Finance data can be delayed and
         should not be used as the sole source for order execution or investment decisions.
