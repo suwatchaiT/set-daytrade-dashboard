@@ -24,16 +24,57 @@ st.set_page_config(
 
 BANGKOK = ZoneInfo("Asia/Bangkok")
 WATCHLIST = {
-    "PTT.BK": "PTT",
-    "KBANK.BK": "KBANK",
-    "SCB.BK": "SCB",
-    "AOT.BK": "AOT",
-    "CPALL.BK": "CPALL",
+    # SET50 constituents for Jul 1–Dec 31, 2026.
     "ADVANC.BK": "ADVANC",
-    "DELTA.BK": "DELTA",
-    "GULF.BK": "GULF",
+    "AOT.BK": "AOT",
+    "AWC.BK": "AWC",
+    "BANPU.BK": "BANPU",
     "BBL.BK": "BBL",
+    "BCP.BK": "BCP",
+    "BDMS.BK": "BDMS",
+    "BEM.BK": "BEM",
+    "BH.BK": "BH",
+    "BJC.BK": "BJC",
+    "CCET.BK": "CCET",
+    "COM7.BK": "COM7",
+    "CPALL.BK": "CPALL",
+    "CPF.BK": "CPF",
+    "CPN.BK": "CPN",
+    "CRC.BK": "CRC",
+    "DELTA.BK": "DELTA",
+    "EGCO.BK": "EGCO",
+    "GPSC.BK": "GPSC",
+    "GULF.BK": "GULF",
+    "HMPRO.BK": "HMPRO",
+    "IVL.BK": "IVL",
+    "KBANK.BK": "KBANK",
+    "KKP.BK": "KKP",
+    "KTB.BK": "KTB",
     "KTC.BK": "KTC",
+    "LH.BK": "LH",
+    "MINT.BK": "MINT",
+    "MRDIYT.BK": "MRDIYT",
+    "MTC.BK": "MTC",
+    "OR.BK": "OR",
+    "OSP.BK": "OSP",
+    "PTT.BK": "PTT",
+    "PTTEP.BK": "PTTEP",
+    "PTTGC.BK": "PTTGC",
+    "RATCH.BK": "RATCH",
+    "SCB.BK": "SCB",
+    "SCC.BK": "SCC",
+    "SCGP.BK": "SCGP",
+    "TCAP.BK": "TCAP",
+    "TFG.BK": "TFG",
+    "THAI.BK": "THAI",
+    "TIDLOR.BK": "TIDLOR",
+    "TISCO.BK": "TISCO",
+    "TLI.BK": "TLI",
+    "TOP.BK": "TOP",
+    "TRUE.BK": "TRUE",
+    "TTB.BK": "TTB",
+    "TU.BK": "TU",
+    "WHA.BK": "WHA",
 }
 TICKERS = tuple(WATCHLIST)
 SIGNAL_LOG_PATH = Path(__file__).with_name("signal_log.csv")
@@ -135,28 +176,56 @@ def completed_bars(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
     return df
 
 
+def normalize_price_frame(data: pd.DataFrame) -> Optional[pd.DataFrame]:
+    if data is None or data.empty:
+        return None
+    data = flatten_columns(data).dropna(how="all")
+    if data.empty:
+        return None
+    data.index = pd.to_datetime(data.index)
+    if data.index.tz is None:
+        data.index = data.index.tz_localize("UTC")
+    data.index = data.index.tz_convert(BANGKOK)
+    return data
+
+
 @st.cache_data(ttl=120, show_spinner=False)
-def download_prices(ticker: str, interval: str, period: str):
+def download_universe(tickers: tuple[str, ...], interval: str, period: str):
+    """Fetch the whole SET50 in one Yahoo request for a timeframe."""
     try:
-        data = yf.download(
-            ticker,
+        raw = yf.download(
+            list(tickers),
             period=period,
             interval=interval,
             auto_adjust=True,
             progress=False,
-            threads=False,
-            timeout=12,
+            threads=True,
+            group_by="ticker",
+            timeout=20,
         )
-        if data.empty:
-            return None
-        data = flatten_columns(data)
-        data.index = pd.to_datetime(data.index)
-        if data.index.tz is None:
-            data.index = data.index.tz_localize("UTC")
-        data.index = data.index.tz_convert(BANGKOK)
-        return data
+        if raw.empty:
+            return {}
+        output = {}
+        if isinstance(raw.columns, pd.MultiIndex):
+            level0 = set(raw.columns.get_level_values(0))
+            level1 = set(raw.columns.get_level_values(1))
+            for ticker in tickers:
+                if ticker in level0:
+                    frame = raw[ticker].copy()
+                elif ticker in level1:
+                    frame = raw.xs(ticker, axis=1, level=1).copy()
+                else:
+                    continue
+                frame = normalize_price_frame(frame)
+                if frame is not None:
+                    output[ticker] = frame
+        elif len(tickers) == 1:
+            frame = normalize_price_frame(raw)
+            if frame is not None:
+                output[tickers[0]] = frame
+        return output
     except Exception:
-        return None
+        return {}
 
 
 def timeframe_bias(raw: pd.DataFrame, timeframe: str) -> str:
@@ -379,11 +448,15 @@ def final_signal(setup: str, daily: str, hourly: str, confirmed: bool) -> str:
 @st.cache_data(ttl=120, show_spinner=False)
 def build_monitor(tickers: tuple[str, ...]):
     rows, histories = [], {}
+    daily_map = download_universe(tickers, "1d", "6mo")
+    hourly_map = download_universe(tickers, "1h", "1mo")
+    setup_map = download_universe(tickers, "15m", "5d")
+    trigger_map = download_universe(tickers, "5m", "5d")
     for ticker in tickers:
-        daily = download_prices(ticker, "1d", "6mo")
-        hourly = download_prices(ticker, "1h", "1mo")
-        setup_data = download_prices(ticker, "15m", "5d")
-        trigger_data = download_prices(ticker, "5m", "5d")
+        daily = daily_map.get(ticker)
+        hourly = hourly_map.get(ticker)
+        setup_data = setup_map.get(ticker)
+        trigger_data = trigger_map.get(ticker)
         if any(item is None for item in (daily, hourly, setup_data, trigger_data)):
             continue
         result = score_setup(ticker, setup_data)
@@ -444,7 +517,8 @@ def record_signals(frame: pd.DataFrame, logged_at: datetime) -> pd.DataFrame:
             "Rel Volume": row["Rel Volume"], "RSI": row["RSI"], "Setup": row["Setup"],
         })
     if records:
-        existing = pd.concat([existing, pd.DataFrame(records)], ignore_index=True)
+        new_records = pd.DataFrame(records, columns=LOG_COLUMNS)
+        existing = new_records if existing.empty else pd.concat([existing, new_records], ignore_index=True)
         try:
             existing.to_csv(SIGNAL_LOG_PATH, index=False)
         except OSError:
@@ -511,12 +585,16 @@ with refresh_col:
 if auto_refresh:
     st_autorefresh(interval=120_000, key="market-refresh")
 
-with st.spinner("Scanning 10 liquid SET stocks…"):
+with st.spinner("Scanning all 50 SET50 constituents across four timeframes…"):
     monitor, histories = build_monitor(TICKERS)
 
 if monitor.empty:
     st.error("Market data is temporarily unavailable. Try Refresh again in a minute.")
     st.stop()
+
+missing = sorted(set(WATCHLIST.values()) - set(monitor["Stock"]))
+if missing:
+    st.warning(f"Yahoo data unavailable for {len(missing)} constituent(s): {', '.join(missing)}")
 
 signal_log = record_signals(monitor, now)
 actionable = monitor[monitor["Signal"].isin(["BUY NOW", "SELL NOW", "ARMED LONG", "ARMED SHORT"])]
@@ -548,14 +626,14 @@ styled = (
         na_rep="—",
     )
 )
-st.dataframe(styled, width="stretch", hide_index=True, height=425)
+st.dataframe(styled, width="stretch", hide_index=True, height=700)
 st.caption("BUY/SELL NOW requires aligned 1D + 1H direction and a volume-confirmed 5-minute trigger cross. ARMED means aligned but not yet triggered.")
 
 left, right = st.columns([1.1, 1])
 with left:
     st.subheader("Signal strength")
     signal_chart = px.bar(
-        monitor.sort_values("Score"),
+        monitor.nlargest(20, ["Score", "Rel Volume"]).sort_values("Score"),
         x="Score",
         y="Stock",
         orientation="h",
